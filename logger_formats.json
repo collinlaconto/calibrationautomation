@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Format registry for probe_sync.py.",
+    "Add a new entry here to support any additional data logger brand — no code changes needed.",
+    "",
+    "Fields per entry:",
+    "  description     Human-readable brand / software name (shown in the GUI and log).",
+    "  signature       List of strings searched in the file's first ~15 lines (case-insensitive).",
+    "                  If ANY signature matches, this format is selected. Make signatures",
+    "                  distinctive enough that they won't match the wrong brand.",
+    "  date_col        Column name for the date, when date and time are in SEPARATE columns.",
+    "                  Omit (or set null) for combined-timestamp formats.",
+    "  time_col        Column name for the time (or the combined timestamp column).",
+    "  value_col       Column name for the temperature reading.",
+    "  dayfirst        true  = date is DD/MM/YYYY (European, e.g. EasyLog, Omega).",
+    "                  false = date is MM/DD/YYYY (US, e.g. MadgeTech) or YYYY-first (ISO).",
+    "                  Only matters for ambiguous dates where day <= 12.",
+    "  datetime_format Optional explicit Python strptime string, e.g. \"%d.%m.%Y %H:%M:%S\".",
+    "                  Use this for formats that pandas cannot reliably auto-detect.",
+    "                  Overrides dayfirst when present.",
+    "",
+    "Example — adding a hypothetical 'AcmeCorp' logger:",
+    "  \"acmecorp\": {",
+    "    \"description\": \"AcmeCorp DataMaster Software\",",
+    "    \"signature\": [\"AcmeCorp DataMaster\"],",
+    "    \"time_col\": \"Timestamp\",",
+    "    \"value_col\": \"Temp_C\",",
+    "    \"datetime_format\": \"%d.%m.%Y %H:%M\"",
+    "  }"
+  ],
+
+  "easylog": {
+    "description": "Lascar EasyLog / Omega OM-EL-USB (same software, OEM)",
+    "signature": ["Logger Name:"],
+    "date_col": "Date (DD/MM/YYYY)",
+    "time_col": "Time (HH:mm:ss)",
+    "value_col": "Temperature (\u00b0C)",
+    "dayfirst": true
+  },
+
+  "madgetech": {
+    "description": "MadgeTech 4 Data Logger Software",
+    "signature": ["Reading #,Date,Time", "Device Name,Model,Serial Number"],
+    "date_col": "Date",
+    "time_col": "Time",
+    "value_col": "Temperature, \u00b0C",
+    "dayfirst": false
+  },
+
+  "reed": {
+    "description": "Reed Instruments data loggers",
+    "signature": ["Device: Reed"],
+    "time_col": "Date/Time",
+    "value_col": "Temperature (\u00b0C)",
+    "dayfirst": false
+  },
+
+  "vaisala": {
+    "description": "Vaisala vLog software",
+    "signature": ["Vaisala vLog"],
+    "time_col": "Date/Time",
+    "value_col": "Temperature (\u00b0C)",
+    "dayfirst": false
+  }
+}
