@@ -152,6 +152,37 @@ def _find_header_row(path: str, search_names: list) -> int:
     return 0
 
 
+def _read_tabular(path: str, skiprows: int = 0, **kwargs) -> pd.DataFrame:
+    """
+    Read a delimited data file regardless of whether it is .csv or .txt.
+
+    Both extensions are treated identically: the file is first opened and
+    the first non-skipped data line is inspected to determine the separator.
+
+    Detection order:
+      1. Comma   (",")  — covers .csv and comma-exported .txt files
+      2. Tab     ("\t") — covers tab-delimited .txt files
+      3. Falls back to comma if neither produces more than one column.
+
+    All keyword arguments are forwarded to pd.read_csv().
+    """
+    # Read a sample line (after any skipped rows) to detect the separator
+    sep = ","   # default
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for _ in range(skiprows):
+                fh.readline()
+            sample_line = fh.readline()
+        comma_count = sample_line.count(",")
+        tab_count   = sample_line.count("\t")
+        if tab_count > comma_count:
+            sep = "\t"
+    except OSError:
+        pass
+
+    return pd.read_csv(path, skiprows=skiprows, sep=sep, **kwargs)
+
+
 # Keywords used for value-pattern fallback detection
 _TEMP_KEYWORDS      = ["temperature", "temp", "\u00b0c", "\u00b0f",
                         "degc", "degf", "celsius", "fahrenheit"]
@@ -235,7 +266,7 @@ def detect_file_format(path: str, registry: dict) -> tuple:
 
     header_row = _find_header_row(path, hints)
     try:
-        sample = pd.read_csv(path, skiprows=header_row, nrows=5, dtype=str)
+        sample = _read_tabular(path, skiprows=header_row, nrows=5, dtype=str)
         sample.columns = sample.columns.str.strip()
         columns = set(sample.columns)
     except Exception:
@@ -311,17 +342,60 @@ def detect_file_format(path: str, registry: dict) -> tuple:
 # SECTION 3 — FILE LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Known probe time column names (Additel 286 DAQ exports)
+_PROBE_TIME_CANDIDATES  = ["Step Time", "Time"]
+# Known probe value column names — REF channels + generic temperature labels
+_PROBE_VALUE_CANDIDATES = ["REF1", "REF2", "Temperature (°C)", "Temperature(°C)",
+                            "Temp (°C)", "Temp(°C)", "Temperature"]
+
+
+def detect_probe_columns(path: str) -> tuple:
+    """
+    Scan a probe file and return (time_col, available_value_cols).
+
+    time_col             : the first matching time column found, or None
+    available_value_cols : list of all REF/temperature columns present
+                           (may contain REF1, REF2, or both)
+
+    Called by the GUI when the user browses for a probe file so the REF
+    dropdown can be pre-populated with whatever channels the file contains.
+    Called again inside load_probe() when time_col or value_col is None.
+    """
+    # Find the header row using all candidate column names as hints
+    hints = _PROBE_TIME_CANDIDATES + _PROBE_VALUE_CANDIDATES
+    header_row = _find_header_row(path, hints)
+    try:
+        df = _read_tabular(path, skiprows=header_row, nrows=2, dtype=str)
+        df.columns = df.columns.str.strip()
+    except Exception:
+        return None, []
+
+    # First matching time column
+    time_col = next(
+        (c for c in _PROBE_TIME_CANDIDATES if c in df.columns), None
+    )
+    # All matching value columns — preserves order (REF1 before REF2)
+    value_cols = [c for c in _PROBE_VALUE_CANDIDATES if c in df.columns]
+
+    return time_col, value_cols
+
+
 def load_probe(path: str, time_col: str, value_col: str,
                start: datetime) -> pd.DataFrame:
     """
-    Load the Additel 286 DAQ probe CSV.
+    Load the Additel 286 DAQ probe file (.csv or .txt).
+
+    Accepted time column names : "Step Time", "Time"  (auto-detected if None)
+    Accepted value column names: "REF1", "REF2", or any temperature column
+                                  (auto-detected if None — first match wins)
 
     The probe records elapsed time in MM:SS format that resets to 00:00 every
     hour.  This function:
       1. Skips the metadata preamble to find the column header row.
-      2. Parses each elapsed-time string into seconds.
-      3. Detects and stitches clock resets (adds +3600 s per reset).
-      4. Converts elapsed seconds to absolute datetimes using `start`.
+      2. Auto-detects time/value columns if not explicitly supplied.
+      3. Parses each elapsed-time string into seconds.
+      4. Detects and stitches clock resets (adds +3600 s per reset).
+      5. Converts elapsed seconds to absolute datetimes using `start`.
     """
     def _parse_elapsed(val: str) -> float:
         val = str(val).strip()
@@ -336,8 +410,28 @@ def load_probe(path: str, time_col: str, value_col: str,
         except ValueError:
             raise ValueError(f"Cannot parse elapsed time: '{val}'")
 
+    # ── Auto-detect columns if caller passed None ────────────────────────────
+    auto_time, auto_values = detect_probe_columns(path)
+    if time_col is None:
+        time_col = auto_time
+    if value_col is None:
+        value_col = auto_values[0] if auto_values else None
+
+    if not time_col or not value_col:
+        auto_time2, auto_values2 = detect_probe_columns(path)
+        hints = _PROBE_TIME_CANDIDATES + _PROBE_VALUE_CANDIDATES
+        header_row_check = _find_header_row(path, hints)
+        df_check = _read_tabular(path, skiprows=header_row_check, nrows=1, dtype=str)
+        raise KeyError(
+            f"Could not identify probe columns automatically.\n"
+            f"  Available columns: {list(df_check.columns.str.strip())}\n"
+            f"  Expected time column: one of {_PROBE_TIME_CANDIDATES}\n"
+            f"  Expected value column: one of {_PROBE_VALUE_CANDIDATES}"
+        )
+
+    # ── Load ─────────────────────────────────────────────────────────────────
     header_row = _find_header_row(path, [time_col, value_col])
-    df = pd.read_csv(path, skiprows=header_row, dtype=str)
+    df = _read_tabular(path, skiprows=header_row, dtype=str)
     df.columns = df.columns.str.strip()
 
     for col in [time_col, value_col]:
@@ -374,7 +468,7 @@ def load_device(path: str, fmt: dict) -> pd.DataFrame:
 
     search = [s for s in [time_col, date_col, value_col] if s]
     header_row = _find_header_row(path, search)
-    df = pd.read_csv(path, skiprows=header_row, dtype=str)
+    df = _read_tabular(path, skiprows=header_row, dtype=str)
     df.columns = df.columns.str.strip()
 
     for col in [c for c in [time_col, value_col] if c]:
@@ -635,12 +729,16 @@ if HAS_TK:
             ttk.Label(pf, text="YYYY-MM-DD HH:MM:SS",
                       foreground="gray").grid(row=1, column=2, sticky="w", **PAD)
 
-            ttk.Label(pf, text="Value column:").grid(
+            ttk.Label(pf, text="Channel:").grid(
                 row=2, column=0, sticky="w", **PAD)
-            self.probe_val_var = tk.StringVar(value="Temperature (\u00b0C)")
-            ttk.Entry(pf, textvariable=self.probe_val_var, width=28).grid(
-                row=2, column=1, sticky="w", **PAD)
-            ttk.Label(pf, text="(match exactly to your file's header)",
+            self.probe_val_var = tk.StringVar(value="REF1")
+            self.channel_combo = ttk.Combobox(
+                pf, textvariable=self.probe_val_var,
+                values=["REF1", "REF2"],
+                state="readonly", width=12,
+            )
+            self.channel_combo.grid(row=2, column=1, sticky="w", **PAD)
+            ttk.Label(pf, text="(auto-updated when you select a probe file)",
                       foreground="gray").grid(row=2, column=2, sticky="w", **PAD)
 
             # ── Device loggers section ────────────────────────────────────────
@@ -704,8 +802,13 @@ if HAS_TK:
 
         def _browse_probe(self):
             path = filedialog.askopenfilename(
-                title="Select Additel 286 Probe CSV",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Select Additel 286 Probe File",
+                filetypes=[
+                    ("Data files", "*.csv *.txt"),
+                    ("CSV files",  "*.csv"),
+                    ("Text files", "*.txt"),
+                    ("All files",  "*.*"),
+                ],
             )
             if path:
                 self.probe_var.set(path)
@@ -713,11 +816,25 @@ if HAS_TK:
                 default_out = str(Path(path).parent / "chart.html")
                 if self.output_var.get() in ("", "chart.html"):
                     self.output_var.set(default_out)
+                # Scan the file and populate the channel dropdown with
+                # whichever REF/temperature columns are actually present
+                try:
+                    _, val_cols = detect_probe_columns(path)
+                    if val_cols:
+                        self.channel_combo["values"] = val_cols
+                        self.probe_val_var.set(val_cols[0])
+                except Exception:
+                    pass   # leave dropdown as-is if file can't be read yet
 
         def _add_devices(self):
             paths = filedialog.askopenfilenames(
-                title="Select Device Logger CSVs (all brands, any mix)",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Select Device Logger Files (all brands, any mix)",
+                filetypes=[
+                    ("Data files", "*.csv *.txt"),
+                    ("CSV files",  "*.csv"),
+                    ("Text files", "*.txt"),
+                    ("All files",  "*.*"),
+                ],
             )
             for path in paths:
                 if path in self.device_paths:
@@ -807,7 +924,7 @@ if HAS_TK:
             def worker():
                 success = run_pipeline(
                     probe_path        = probe_path,
-                    probe_time_col    = "Time",
+                    probe_time_col    = None,   # auto-detected from file
                     probe_value_col   = self.probe_val_var.get().strip(),
                     start_dt          = start_dt,
                     device_paths      = list(self.device_paths),
@@ -845,8 +962,10 @@ def cli_main(registry: dict):
     parser.add_argument("--devices", required=True, nargs="+")
     parser.add_argument("--start",   required=True,
                         help='e.g. "2024-06-01 14:00:00"')
-    parser.add_argument("--probe-time-col",  default="Time")
-    parser.add_argument("--probe-value-col", default="Temperature (\u00b0C)")
+    parser.add_argument("--probe-time-col",  default=None,
+                        help="Probe time column (default: auto-detect from Step Time / Time)")
+    parser.add_argument("--probe-value-col", default=None,
+                        help="Probe value column (default: auto-detect REF1, REF2, or Temperature)")
     parser.add_argument("--output", default="chart.html")
     args = parser.parse_args()
 
