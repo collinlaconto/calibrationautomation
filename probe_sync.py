@@ -429,7 +429,7 @@ def detect_file_format(path: str, registry: dict) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Known probe column names (Additel 286 DAQ)
-_PROBE_TIME_CANDIDATES  = ["Step Time", "Time"]
+_PROBE_TIME_CANDIDATES  = ["Step Time", "Time", "Run Time"]
 _PROBE_VALUE_CANDIDATES = ["REF1", "REF2",
                             "Temperature (\u00b0C)", "Temperature(\u00b0C)",
                             "Temp (\u00b0C)", "Temp(\u00b0C)", "Temperature"]
@@ -486,21 +486,65 @@ def detect_probe_columns(path: str) -> tuple:
     return time_col, val_cols
 
 
+def _is_absolute_timestamp(value: str) -> bool:
+    """
+    Return True if a string looks like an absolute datetime rather than an
+    elapsed duration.
+
+    Absolute:  "2026-05-27 20:42:00.000"  "2026/05/27 20:42:00"
+    Elapsed:   "58:35.0"  "01:03:42"  "3822"
+
+    Rule: if the string contains four or more consecutive digits at the start
+    (i.e. a year), it is absolute.  Elapsed values never start with a 4-digit
+    group because even a 99-hour elapsed time is only "99:59:59".
+    """
+    return bool(re.match(r"^\d{4}", value.strip()))
+
+
+def probe_needs_start_time(path: str) -> bool:
+    """
+    Return True if the probe file uses elapsed MM:SS format and therefore
+    requires a start datetime to anchor its timestamps.
+
+    Returns False for absolute-timestamp files (most common case) and also
+    on any read error, so the UI defaults to hiding the field.
+    """
+    try:
+        time_col, _ = detect_probe_columns(path)
+        if not time_col:
+            return False
+        header_row = _find_header_row(path, [time_col], require_all=False)
+        df = _read_tabular(path, skiprows=header_row, nrows=2, dtype=str)
+        df.columns = df.columns.str.strip()
+        if time_col not in df.columns or df.empty:
+            return False
+        first_val = str(df[time_col].iloc[0]).strip()
+        return not _is_absolute_timestamp(first_val)
+    except Exception:
+        return False
+
+
 def load_probe(path: str, time_col, value_col,
                start: datetime) -> pd.DataFrame:
     """
     Load the Additel 286 DAQ probe file (.csv or .txt).
 
-    Accepted time columns : "Step Time", "Time"  (auto-detected if None)
+    Accepted time columns : "Step Time", "Time", "Run Time"  (auto-detected if None)
     Accepted value columns: "REF1", "REF2", Temperature variants (auto if None)
 
-    The probe records elapsed time in MM:SS or MM:SS.d format, resetting to
-    00:00 every hour.  This function:
-      1. Finds the real header row (AND logic avoids preamble false-matches).
-      2. Auto-detects column names if not supplied.
-      3. Parses elapsed-time strings to seconds.
-      4. Stitches clock resets (+3600 s per reset).
-      5. Converts elapsed seconds → absolute datetimes anchored to `start`.
+    The Additel 286 DAQ can export the Step Time column in two formats
+    depending on its settings:
+
+    Format A — Elapsed time  (e.g. "58:35.0", resets every hour)
+        Parsed to seconds, clock resets stitched, then anchored to `start`.
+        The `start` datetime you enter in the GUI is required and used.
+
+    Format B — Absolute datetime  (e.g. "2026-05-27 20:42:00.000")
+        Parsed directly as wall-clock timestamps.
+        The `start` parameter is still accepted but not needed for alignment
+        — the timestamps are already absolute.
+
+    The format is detected automatically by inspecting the first data value.
     """
     def _parse_elapsed(val: str) -> float:
         val = str(val).strip()
@@ -508,7 +552,7 @@ def load_probe(path: str, time_col, value_col,
         m = re.fullmatch(r"(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", val)
         if m:
             return int(m.group(1))*3600 + int(m.group(2))*60 + float(m.group(3))
-        # MM:SS[.d]  (Additel 286 format)
+        # MM:SS[.d]  (most common Additel 286 export)
         m = re.fullmatch(r"(\d+):(\d{2}(?:\.\d+)?)", val)
         if m:
             return int(m.group(1))*60 + float(m.group(2))
@@ -546,15 +590,29 @@ def load_probe(path: str, time_col, value_col,
                 f"  Available: {list(df.columns)}"
             )
 
-    # Drop any trailing rows that aren't real data (empty / non-numeric time)
+    # Drop blank / non-data rows
     df = df[df[time_col].notna() & (df[time_col].str.strip() != "")]
 
-    raw_s   = df[time_col].apply(_parse_elapsed)
-    offsets = (raw_s.diff() < 0).cumsum() * 3600
-    elapsed = raw_s + offsets
+    # ── Detect timestamp format from first data value ─────────────────────
+    first_val = str(df[time_col].iloc[0]).strip()
 
-    df["_abs_time"] = [start + timedelta(seconds=float(s)) for s in elapsed]
-    df["_value"]    = pd.to_numeric(df[value_col], errors="coerce")
+    if _is_absolute_timestamp(first_val):
+        # Format B — absolute datetimes, parse directly
+        df["_abs_time"] = pd.to_datetime(df[time_col].str.strip())
+    else:
+        # Format A — elapsed MM:SS, stitch resets, anchor to start
+        if start is None:
+            raise ValueError(
+                "START_TIME_REQUIRED: This probe file uses elapsed time format "
+                "(e.g. '58:35.0') and needs a start date/time to convert to "
+                "real timestamps.\nPlease enter the test start date and time."
+            )
+        raw_s   = df[time_col].apply(_parse_elapsed)
+        offsets = (raw_s.diff() < 0).cumsum() * 3600
+        elapsed = raw_s + offsets
+        df["_abs_time"] = [start + timedelta(seconds=float(s)) for s in elapsed]
+
+    df["_value"] = pd.to_numeric(df[value_col], errors="coerce")
     return df[["_abs_time", "_value"]].dropna()
 
 
@@ -846,13 +904,17 @@ if HAS_TK:
             ttk.Button(pf, text="Browse\u2026",
                        command=self._browse_probe).grid(row=0, column=2, **PAD)
 
-            ttk.Label(pf, text="Start time:").grid(
-                row=1, column=0, sticky="w", **PAD)
-            self.start_var = tk.StringVar(value="")
-            ttk.Entry(pf, textvariable=self.start_var, width=22).grid(
-                row=1, column=1, sticky="w", **PAD)
-            ttk.Label(pf, text="YYYY-MM-DD HH:MM:SS",
-                      foreground="gray").grid(row=1, column=2, sticky="w", **PAD)
+            # Start time row — hidden by default, shown only when the probe
+            # file uses elapsed MM:SS format and needs anchoring.
+            self._start_label = ttk.Label(pf, text="Start time:")
+            self.start_var    = tk.StringVar(value="")
+            self._start_entry = ttk.Entry(pf, textvariable=self.start_var,
+                                          width=22)
+            self._start_hint  = ttk.Label(pf,
+                                          text="YYYY-MM-DD HH:MM:SS  "
+                                               "(required \u2014 probe uses elapsed time)",
+                                          foreground="#e07b00")
+            # Don't grid them yet — _show_start_time() does that on demand.
 
             ttk.Label(pf, text="Channel:").grid(
                 row=2, column=0, sticky="w", **PAD)
@@ -915,6 +977,19 @@ if HAS_TK:
             self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
             self._log("Ready.  Select files and click \u25b6 Generate Chart.")
 
+        def _show_start_time(self):
+            """Grid the start time row into the probe frame (row 1)."""
+            PAD = dict(padx=8, pady=4)
+            self._start_label.grid(row=1, column=0, sticky="w", **PAD)
+            self._start_entry.grid(row=1, column=1, sticky="w", **PAD)
+            self._start_hint.grid( row=1, column=2, sticky="w", **PAD)
+
+        def _hide_start_time(self):
+            """Remove the start time row from the probe frame."""
+            self._start_label.grid_remove()
+            self._start_entry.grid_remove()
+            self._start_hint.grid_remove()
+
         # ── File dialogs ──────────────────────────────────────────────────────
 
         def _browse_probe(self):
@@ -938,6 +1013,11 @@ if HAS_TK:
                     self.probe_val_var.set(val_cols[0])
             except Exception:
                 pass
+            # Show start time field only if the probe uses elapsed MM:SS format
+            if probe_needs_start_time(path):
+                self._show_start_time()
+            else:
+                self._hide_start_time()
 
         def _add_devices(self):
             paths = filedialog.askopenfilenames(
@@ -994,7 +1074,6 @@ if HAS_TK:
 
         def _run(self):
             probe_path  = self.probe_var.get().strip()
-            start_str   = self.start_var.get().strip()
             output_path = self.output_var.get().strip()
 
             if not probe_path:
@@ -1005,18 +1084,24 @@ if HAS_TK:
                 messagebox.showwarning("Missing Input",
                                        "Please add at least one device file.")
                 return
-            if not start_str:
-                messagebox.showwarning("Missing Input",
-                                       "Please enter the probe start time.")
-                return
-            try:
-                start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                messagebox.showerror(
-                    "Invalid Input",
-                    "Start time must be YYYY-MM-DD HH:MM:SS\n"
-                    f"Got: {start_str!r}")
-                return
+
+            # Parse start time only if the field is currently visible
+            start_dt = None
+            if self._start_label.winfo_ismapped():
+                start_str = self.start_var.get().strip()
+                if not start_str:
+                    messagebox.showwarning("Missing Input",
+                                           "This probe file needs a start time.\n"
+                                           "Please fill in the Start time field.")
+                    return
+                try:
+                    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid Input",
+                        "Start time must be YYYY-MM-DD HH:MM:SS\n"
+                        f"Got: {start_str!r}")
+                    return
 
             self.log_box.configure(state="normal")
             self.log_box.delete("1.0", "end")
@@ -1038,8 +1123,22 @@ if HAS_TK:
                 if success:
                     self.after(0, lambda: messagebox.showinfo(
                         "Done", f"Chart saved to:\n{output_path}"))
+                else:
+                    # If the pipeline failed because start time was needed,
+                    # reveal the field so the user can fill it in and retry.
+                    self.after(0, self._check_if_start_time_needed)
 
             threading.Thread(target=worker, daemon=True).start()
+
+        def _check_if_start_time_needed(self):
+            """Show the start time field if the log contains a start-time error."""
+            log_content = self.log_box.get("1.0", "end")
+            if "START_TIME_REQUIRED" in log_content:
+                self._show_start_time()
+                self._log(
+                    "\n\u26a0  Start time required.  Fill in the field above "
+                    "and click \u25b6 Generate Chart again."
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
