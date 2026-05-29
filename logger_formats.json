@@ -69,5 +69,16 @@
     "time_col": "Date",
     "value_col": "Temperature (°C)",
     "xlsx": true
+  },
+  "hobo_wireless_xlsx": {
+    "description": "HOBO Wireless Data Logger (HOBOconnect / HOBOware Excel export)",
+    "signature": [
+      "Series : Temperature , °C",
+      "Deployment Info"
+    ],
+    "time_col": "Date-Time",
+    "value_col": "Temperature , °C",
+    "sheet": "Data",
+    "xlsx": true
   }
 }

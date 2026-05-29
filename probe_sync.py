@@ -306,23 +306,30 @@ def _infer_dayfirst(date_values) -> bool:
     return False
 
 
-def _read_preamble_xlsx(path: str, n: int = 10) -> str:
+def _read_preamble_xlsx(path: str, n: int = 100) -> str:
     """
-    Read the first n rows of an Excel file as a lowercased string so that
-    signature matching works the same way for xlsx as for csv/txt.
-    openpyxl is used; all cell values are converted to strings.
+    Read the first n rows of every sheet in an Excel workbook as a single
+    lowercased string for signature matching.
+
+    Scanning all sheets (not just the active one) is necessary for workbooks
+    like the HOBO Wireless export, which stores device metadata on a separate
+    "Details" sheet while data lives on a "Data" sheet.  The signature text
+    that uniquely identifies the brand ("Series : Temperature , °C") only
+    appears on Details, so reading only the active (Data) sheet would miss it.
     """
     try:
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        lines = []
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i >= n:
-                break
-            lines.append(",".join(str(c) for c in row if c is not None).lower())
+        all_lines = []
+        for ws in wb.worksheets:          # iterate every sheet
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= n:
+                    break
+                all_lines.append(
+                    ",".join(str(c) for c in row if c is not None).lower()
+                )
         wb.close()
-        return "\n".join(lines)
+        return "\n".join(all_lines)
     except Exception:
         return ""
 
@@ -429,7 +436,7 @@ def detect_file_format(path: str, registry: dict) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Known probe column names (Additel 286 DAQ)
-_PROBE_TIME_CANDIDATES  = ["Step Time", "Time", "Run Time"]
+_PROBE_TIME_CANDIDATES  = ["Step Time", "Time"]
 _PROBE_VALUE_CANDIDATES = ["REF1", "REF2",
                             "Temperature (\u00b0C)", "Temperature(\u00b0C)",
                             "Temp (\u00b0C)", "Temp(\u00b0C)", "Temperature"]
@@ -529,7 +536,7 @@ def load_probe(path: str, time_col, value_col,
     """
     Load the Additel 286 DAQ probe file (.csv or .txt).
 
-    Accepted time columns : "Step Time", "Time", "Run Time"  (auto-detected if None)
+    Accepted time columns : "Step Time", "Time"  (auto-detected if None)
     Accepted value columns: "REF1", "REF2", Temperature variants (auto if None)
 
     The Additel 286 DAQ can export the Step Time column in two formats
@@ -618,41 +625,88 @@ def load_probe(path: str, time_col, value_col,
 
 def _load_device_xlsx(path: str, fmt: dict) -> pd.DataFrame:
     """
-    Load an Excel (.xlsx) device file, e.g. Omega OM-CP exports.
+    Load an Excel (.xlsx) device file.
 
-    The Omega OM-CP export has a multi-row metadata preamble followed by a
-    header row containing 'Date', 'Time', and 'Temperature (°C)'.  Both the
-    Date and Time columns contain full Python datetime objects (openpyxl
-    reads them natively), so the Date column is used directly as _abs_time.
+    Supports the following format-dict fields beyond the standard ones:
 
-    This function is called automatically when the format dict contains
-    {"xlsx": true} or when the file extension is .xlsx.
+      sheet : str (optional)
+          Name of the sheet that contains the data.  If omitted, the active
+          (first/default) sheet is used.  Use this when the workbook has
+          multiple sheets and the data is not on the first one — e.g. the
+          HOBO Wireless export puts data on a sheet called "Data".
+
+      time_col : str
+          The header cell text for the timestamp column, or a prefix of it.
+          Prefix matching is used so "Date-Time" matches "Date-Time (EDT)".
+
+      value_col : str
+          The header cell text for the temperature column, or a prefix of it.
+
+    Column matching uses prefix logic (startswith) so you don't need to
+    include timezone suffixes or other variable text in the registry entry.
+
+    Timestamps are used directly when openpyxl returns datetime objects
+    (Excel date cells).  String values are parsed with pandas as a fallback.
     """
     import openpyxl
     time_col  = fmt.get("time_col", "Date")
     value_col = fmt.get("value_col", "Temperature (\u00b0C)")
+    sheet     = fmt.get("sheet")          # None → use active sheet
 
     wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
 
-    # Find the header row: first row where time_col and value_col both appear
+    # Select the requested sheet, or fall back to the active sheet
+    if sheet and sheet in wb.sheetnames:
+        ws = wb[sheet]
+    elif sheet:
+        wb.close()
+        raise KeyError(
+            f"XLSX file '{os.path.basename(path)}': sheet '{sheet}' not found.\n"
+            f"  Available sheets: {wb.sheetnames}\n"
+            f"  Tip: update the 'sheet' field in logger_formats.json."
+        )
+    else:
+        ws = wb.active
+
+    # Find the header row: first row where BOTH time_col and value_col match
+    # (exact match first, then prefix/startswith for columns with variable suffixes
+    #  like "Date-Time (EDT)" when the registry stores just "Date-Time")
+    def _matches(cell_text: str, target: str) -> bool:
+        t = cell_text.strip()
+        return t == target or t.startswith(target)
+
     header_row_idx = None
     rows = list(ws.iter_rows(values_only=True))
     for i, row in enumerate(rows):
         row_strs = [str(c).strip() if c is not None else "" for c in row]
-        if time_col in row_strs and value_col in row_strs:
+        has_time  = any(_matches(s, time_col)  for s in row_strs)
+        has_value = any(_matches(s, value_col) for s in row_strs)
+        if has_time and has_value:
             header_row_idx = i
             break
 
     if header_row_idx is None:
+        wb.close()
         raise KeyError(
-            f"XLSX file '{os.path.basename(path)}': could not find header row "
-            f"containing '{time_col}' and '{value_col}'."
+            f"XLSX file '{os.path.basename(path)}': could not find a header row "
+            f"containing both '{time_col}' and '{value_col}'.\n"
+            f"  Sheet searched: '{ws.title}'\n"
+            f"  All column names found: "
+            f"{[c for c in rows[0] if c is not None]}"
         )
 
-    headers    = [str(c).strip() if c is not None else "" for c in rows[header_row_idx]]
-    time_idx   = headers.index(time_col)
-    value_idx  = headers.index(value_col)
+    # Resolve actual column indices using the same prefix logic
+    headers = [str(c).strip() if c is not None else "" for c in rows[header_row_idx]]
+    time_idx  = next((i for i, h in enumerate(headers) if _matches(h, time_col)),  None)
+    value_idx = next((i for i, h in enumerate(headers) if _matches(h, value_col)), None)
+
+    if time_idx is None or value_idx is None:
+        wb.close()
+        raise KeyError(
+            f"XLSX file '{os.path.basename(path)}': internal column resolution "
+            f"failed for '{time_col}' or '{value_col}'.\n"
+            f"  Headers: {headers}"
+        )
 
     records = []
     for row in rows[header_row_idx + 1:]:
